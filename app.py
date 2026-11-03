@@ -1,13 +1,16 @@
 import base64
 import html
+import json
 import os
 import re
 import time
+from urllib.parse import quote, urljoin
 
 import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
+from bs4 import BeautifulSoup
 
 # 1. Configuración de página
 st.set_page_config(
@@ -21,15 +24,22 @@ LOGO_BLANCO = "assets/logo_kia_blanco.png"
 
 NEGRO = "#05141F"
 ROJO = "#BB162B"
+GRIS = "#64748B"
 
 MAX_CODIGOS = 20   # máximo de códigos por consulta masiva
-PAUSA = 0.5        # segundos entre consultas, para no saturar al competidor
+PAUSA = 0.5        # segundos entre códigos, para no saturar a los competidores
+
+# Repuestos Boston (parece una tienda Magento; ajusta esta URL si su buscador es distinto).
+# {q} se reemplaza por el código buscado.
+BOSTON_BASE = "https://www.repuestosboston.cl"
+BOSTON_BUSQUEDA = BOSTON_BASE + "/catalogsearch/result/?q={q}"
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept-Language": "es-CL,es;q=0.9",
 }
 
 
@@ -67,7 +77,7 @@ def fmt_signed(n) -> str:
 def kpi(label: str, valor: str, delta: str = "", clase: str = "") -> str:
     delta_html = f'<div class="delta {clase}">{delta}</div>' if delta else ""
     return (
-        f'<div class="kpi"><div class="label">{label}</div>'
+        f'<div class="kpi"><div class="label">{html.escape(label)}</div>'
         f'<div class="value">{valor}</div>{delta_html}</div>'
     )
 
@@ -79,8 +89,10 @@ def normalizar(texto: str) -> str:
 
 def limpiar_precio(valor):
     """Convierte '54900', '$54.900', '54900.0' o '54,900' en un entero. None si no hay precio."""
+    if valor is None:
+        return None
     s = str(valor).strip().replace("$", "").replace(" ", "")
-    if not s or s.lower() == "nan":
+    if not s or s.lower() in ("nan", "none"):
         return None
     m = re.fullmatch(r"(\d+)[.,]\d{1,2}", s)  # decimales, ej. 54900.00
     if m:
@@ -90,27 +102,101 @@ def limpiar_precio(valor):
 
 
 # ---------------------------------------------------------------------------
-# Consulta al competidor
+# HTTP y lectura de fichas de producto
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=600, show_spinner=False)
-def consultar_competidor(codigo: str) -> dict:
-    """
-    Consulta MS Repuestos. Lanza RuntimeError si falla la consulta (los errores no se cachean).
-    Devuelve {"estado": "sin_resultados"} o {"estado": "ok", ...}.
-    """
+def _get(url: str, params=None):
+    """GET con errores legibles. Si el sitio bloquea la consulta, se informa (no se intenta evadir)."""
     try:
-        res = requests.get(
-            "https://www.msrepuestos.cl/search/suggest.json",
-            params={"q": codigo, "resources[type]": "product"},
-            headers=HEADERS,
-            timeout=10,
-        )
+        res = requests.get(url, params=params, headers=HEADERS, timeout=12)
     except requests.RequestException as e:
         raise RuntimeError(f"No se pudo conectar ({e.__class__.__name__})")
-
+    if res.status_code in (403, 429, 503):
+        raise RuntimeError(f"El sitio bloqueó la consulta ({res.status_code})")
     if res.status_code != 200:
         raise RuntimeError(f"Respuesta inesperada del servidor ({res.status_code})")
+    return res
 
+
+def _iter_json(obj):
+    """Recorre un JSON anidado devolviendo todos los diccionarios."""
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _iter_json(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _iter_json(v)
+
+
+def extraer_producto(soup: BeautifulSoup) -> dict:
+    """Lee título, precio y disponibilidad desde los datos estructurados de una ficha de producto."""
+    titulo, precio, disponible = None, None, None
+
+    # 1) JSON-LD (schema.org/Product)
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or tag.get_text() or "")
+        except ValueError:
+            continue
+        for nodo in _iter_json(data):
+            tipo = nodo.get("@type")
+            tipos = tipo if isinstance(tipo, list) else [tipo]
+            if "Product" not in tipos:
+                continue
+            titulo = titulo or nodo.get("name")
+            ofertas = nodo.get("offers") or []
+            if isinstance(ofertas, dict):
+                ofertas = [ofertas]
+            for o in ofertas:
+                if not isinstance(o, dict):
+                    continue
+                if precio is None:
+                    precio = limpiar_precio(o.get("price", o.get("lowPrice")))
+                disp = str(o.get("availability", ""))
+                if disponible is None:
+                    if "InStock" in disp:
+                        disponible = True
+                    elif "OutOfStock" in disp:
+                        disponible = False
+
+    # 2) Metadatos y microdatos
+    if not precio:
+        for selector, attr in (
+            ('meta[property="product:price:amount"]', "content"),
+            ('meta[property="og:price:amount"]', "content"),
+            ('[itemprop="price"]', "content"),
+            ("[data-price-amount]", "data-price-amount"),
+        ):
+            el = soup.select_one(selector)
+            if el is not None:
+                precio = limpiar_precio(el.get(attr) or el.get_text())
+                if precio:
+                    break
+
+    if not titulo:
+        og = soup.select_one('meta[property="og:title"]')
+        h1 = soup.find("h1")
+        titulo = (og.get("content") if og else None) or (h1.get_text(strip=True) if h1 else None)
+
+    return {
+        "titulo": (titulo or "Producto encontrado").strip(),
+        "precio": precio if precio and precio > 0 else None,
+        "disponible": disponible,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Competidores. Cada función devuelve:
+#   {"estado": "sin_resultados"}  o
+#   {"estado": "ok", "exacto", "titulo", "url", "precio", "disponible"}
+# y lanza RuntimeError si la consulta falla (los errores no se cachean).
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=600, show_spinner=False)
+def consultar_ms(codigo: str) -> dict:
+    res = _get(
+        "https://www.msrepuestos.cl/search/suggest.json",
+        params={"q": codigo, "resources[type]": "product"},
+    )
     try:
         data = res.json()
     except ValueError:
@@ -120,7 +206,7 @@ def consultar_competidor(codigo: str) -> dict:
     if not productos:
         return {"estado": "sin_resultados"}
 
-    # Buscar el primer producto cuyo título/handle/tags contenga el código buscado
+    # Primer producto cuyo título/handle/tags contenga el código buscado
     clave = normalizar(codigo)
     elegido, exacto = None, False
     for p in productos:
@@ -146,48 +232,116 @@ def consultar_competidor(codigo: str) -> dict:
     }
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def consultar_boston(codigo: str) -> dict:
+    clave = normalizar(codigo)
+    res = _get(BOSTON_BUSQUEDA.format(q=quote(codigo)))
+    soup = BeautifulSoup(res.text, "html.parser")
+
+    # Si el buscador redirige directo a la ficha, la usamos tal cual
+    if res.url.split("?")[0].endswith(".html") and "catalogsearch" not in res.url:
+        url_producto, soup_producto = res.url, soup
+    else:
+        # Enlaces a productos cuyo URL o texto contengan el código
+        candidatos = []
+        for a in soup.find_all("a", href=True):
+            href = urljoin(BOSTON_BASE + "/", a["href"]).split("?")[0].split("#")[0]
+            if not href.startswith(BOSTON_BASE) or not href.endswith(".html"):
+                continue
+            if clave and clave in normalizar(href + " " + a.get_text()) and href not in candidatos:
+                candidatos.append(href)
+        if not candidatos:
+            return {"estado": "sin_resultados"}
+
+        url_producto = candidatos[0]
+        time.sleep(0.3)
+        res_p = _get(url_producto)
+        soup_producto = BeautifulSoup(res_p.text, "html.parser")
+
+    prod = extraer_producto(soup_producto)
+    if prod["precio"] is None:
+        raise RuntimeError("Encontré la ficha pero no pude leer el precio")
+
+    exacto = bool(clave) and clave in normalizar(prod["titulo"] + " " + url_producto)
+    return {
+        "estado": "ok",
+        "exacto": exacto,
+        "titulo": prod["titulo"],
+        "url": url_producto,
+        "precio": float(prod["precio"]),
+        "disponible": prod["disponible"],
+    }
+
+
+# Para agregar otro competidor: crea su función y súmala aquí.
+COMPETIDORES = {
+    "MS Repuestos": consultar_ms,
+    "Repuestos Boston": consultar_boston,
+}
+
+
+def consultar_todos(codigo: str) -> dict:
+    comps = {}
+    for nombre, fn in COMPETIDORES.items():
+        try:
+            comps[nombre] = fn(codigo)
+        except Exception as e:
+            comps[nombre] = {"estado": "error", "error": str(e)}
+    return comps
+
+
+def elegir_referencia(comps: dict):
+    """Competidor más barato (prefiere coincidencias exactas). Devuelve (nombre, datos) o None."""
+    ok = {n: c for n, c in comps.items() if c["estado"] == "ok" and c.get("precio") and c["precio"] > 0}
+    exactos = {n: c for n, c in ok.items() if c.get("exacto")}
+    pool = exactos or ok
+    if not pool:
+        return None
+    nombre = min(pool, key=lambda n: pool[n]["precio"])
+    return nombre, pool[nombre]
+
+
+def etiqueta_coincidencia(c: dict) -> str:
+    if c["estado"] == "error":
+        return "Error"
+    if c["estado"] == "sin_resultados":
+        return "Sin resultado"
+    return "Exacta" if c.get("exacto") else "Revisar"
+
+
 def comparar(codigo: str, mi_precio) -> dict:
-    """Consulta un código y arma la fila de resultado."""
+    """Consulta un código en todos los competidores y arma la fila de resultado."""
+    comps = consultar_todos(codigo)
     fila = {
         "Código": codigo,
-        "Producto": "",
         "Nuestro precio": mi_precio,
-        "MS Repuestos": None,
+        "comp": comps,
+        "Referencia": None,
         "Dif $": None,
         "Dif %": None,
         "Posición": "Sin resultado",
-        "Coincidencia": "—",
-        "Stock": "—",
-        "URL": "",
+        "Coincidencia": "Sin resultado",
     }
-    try:
-        r = consultar_competidor(codigo)
-    except Exception as e:
-        fila["Posición"] = "Error"
-        fila["Producto"] = str(e)
-        fila["Coincidencia"] = "Error"
+
+    ref = elegir_referencia(comps)
+    if ref is None:
+        if any(c["estado"] == "error" for c in comps.values()):
+            fila["Posición"] = "Error"
+            fila["Coincidencia"] = "Error"
         return fila
 
-    if r["estado"] == "sin_resultados":
-        fila["Coincidencia"] = "Sin resultado"
-        return fila
-
-    fila["Producto"] = r["titulo"]
-    fila["URL"] = r["url"]
-    fila["MS Repuestos"] = r["precio"]
-    fila["Coincidencia"] = "Exacta" if r["exacto"] else "Revisar"
-    if r["disponible"] is True:
-        fila["Stock"] = "Disponible"
-    elif r["disponible"] is False:
-        fila["Stock"] = "Agotado"
+    nombre, c = ref
+    fila["Referencia"] = nombre
+    fila["Coincidencia"] = "Exacta" if c.get("exacto") else "Revisar"
 
     if mi_precio is None:
         fila["Posición"] = "Sin precio propio"
-    elif r["precio"] > 0:
-        dif = mi_precio - r["precio"]
-        fila["Dif $"] = dif
-        fila["Dif %"] = dif / r["precio"] * 100
-        fila["Posición"] = "Más barato" if dif < 0 else ("Más caro" if dif > 0 else "Igual")
+        return fila
+
+    dif = mi_precio - c["precio"]
+    fila["Dif $"] = dif
+    fila["Dif %"] = dif / c["precio"] * 100
+    fila["Posición"] = "Más barato" if dif < 0 else ("Más caro" if dif > 0 else "Igual")
     return fila
 
 
@@ -319,7 +473,7 @@ label, .stTextInput label p, .stNumberInput label p, .stTextArea label p {
 /* Tarjeta de producto */
 .product-card {
     background: #F4F5F7; border-left: 4px solid #BB162B; border-radius: 6px;
-    padding: 1.25rem 1.5rem; margin: 1.5rem 0;
+    padding: 1.25rem 1.5rem; margin: 1rem 0;
 }
 .product-card .eyebrow { color: #6B7280; font-size: .75rem; text-transform: uppercase; letter-spacing: 1.2px; font-weight: 600; }
 .product-card h3 { color: #05141F; margin: 4px 0 8px 0; font-size: 1.25rem; font-weight: 700; }
@@ -329,10 +483,10 @@ label, .stTextInput label p, .stNumberInput label p, .stTextArea label p {
 /* Tarjetas KPI */
 .kpi {
     background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 8px;
-    padding: 1.25rem; box-shadow: 0 2px 12px rgba(5, 20, 31, 0.05);
+    padding: 1.25rem; box-shadow: 0 2px 12px rgba(5, 20, 31, 0.05); height: 100%;
 }
 .kpi .label { color: #6B7280; font-size: .85rem; font-weight: 500; }
-.kpi .value { color: #05141F; font-size: 1.9rem; font-weight: 700; margin: .25rem 0; line-height: 1.2; }
+.kpi .value { color: #05141F; font-size: 1.7rem; font-weight: 700; margin: .25rem 0; line-height: 1.2; }
 .kpi .delta { font-size: .85rem; font-weight: 600; }
 .kpi .delta.good { color: #16A34A; }
 .kpi .delta.bad { color: #BB162B; }
@@ -347,6 +501,7 @@ label, .stTextInput label p, .stNumberInput label p, .stTextArea label p {
 .tbl td { padding: .7rem 1rem; border-top: 1px solid #E5E7EB; color: #05141F; vertical-align: middle; }
 .tbl tr:nth-child(even) td { background: #F9FAFB; }
 .tbl td.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tbl td.best { background: #F0FDF4 !important; font-weight: 700; }
 .tbl a { color: #BB162B; text-decoration: none; font-weight: 600; }
 .tbl a:hover { text-decoration: underline; }
 .badge {
@@ -397,65 +552,72 @@ def vista_individual():
         st.warning("Por favor ingresa un código OEM válido.")
         return
 
-    with st.spinner("Escaneando catálogo del competidor..."):
-        try:
-            r = consultar_competidor(codigo)
-        except Exception as e:
-            st.error(f"Error en la ejecución de la consulta: {e}")
-            return
+    with st.spinner("Escaneando catálogos de la competencia..."):
+        comps = consultar_todos(codigo)
 
-    if r["estado"] == "sin_resultados":
-        st.warning(f"No se encontraron productos coincidentes para el código OEM '{codigo}'.")
-        return
-
-    if not r["exacto"]:
-        st.warning(
-            "El producto encontrado no contiene el código buscado en su título. "
-            "Verifica la ficha original antes de usar este dato."
-        )
-
-    precio_competidor = r["precio"]
-    titulo_prod = html.escape(r["titulo"])
-    url_prod = html.escape(r["url"])
-
-    diferencia = mi_precio - precio_competidor
-    porcentaje = (diferencia / precio_competidor) * 100 if precio_competidor > 0 else 0
-
-    st.markdown(f"""
+    # Estado y ficha por competidor
+    hay_resultado = False
+    for nombre, c in comps.items():
+        if c["estado"] == "error":
+            st.warning(f"{nombre}: no se pudo consultar ({c['error']}).")
+        elif c["estado"] == "sin_resultados":
+            st.info(f"{nombre}: sin resultados para el código '{codigo}'.")
+        else:
+            hay_resultado = True
+            if not c["exacto"]:
+                st.warning(
+                    f"{nombre}: el producto encontrado no contiene el código buscado en su título. "
+                    "Verifica la ficha original antes de usar este dato."
+                )
+            st.markdown(f"""
 <div class="product-card">
-<div class="eyebrow">Coincidencia detectada</div>
-<h3>{titulo_prod}</h3>
-<a href="{url_prod}" target="_blank">Ver ficha original en la web del competidor ↗</a>
+<div class="eyebrow">Coincidencia detectada · {html.escape(nombre)}</div>
+<h3>{html.escape(c["titulo"])}</h3>
+<a href="{html.escape(c["url"])}" target="_blank">Ver ficha original en la web del competidor ↗</a>
 </div>
 """, unsafe_allow_html=True)
 
-    m1, m2, m3 = st.columns(3)
-    m1.markdown(kpi("Nuestro precio", fmt(mi_precio)), unsafe_allow_html=True)
-    m2.markdown(kpi("MS Repuestos", fmt(precio_competidor)), unsafe_allow_html=True)
+    if not hay_resultado:
+        return
 
-    if diferencia < 0:
-        m3.markdown(
-            kpi("Posición de precio", f"{fmt(abs(diferencia))} más económicos",
-                f"▼ {abs(porcentaje):.1f}% (ventaja)", "good"),
-            unsafe_allow_html=True,
-        )
+    # Métricas
+    cols = st.columns(len(comps) + 2)
+    cols[0].markdown(kpi("Nuestro precio", fmt(mi_precio)), unsafe_allow_html=True)
+    for i, (nombre, c) in enumerate(comps.items(), 1):
+        valor = fmt(c["precio"]) if c["estado"] == "ok" and c.get("precio") else "—"
+        cols[i].markdown(kpi(nombre, valor), unsafe_allow_html=True)
+
+    ref = elegir_referencia(comps)
+    if ref is None:
+        cols[-1].markdown(kpi("Posición de precio", "—"), unsafe_allow_html=True)
     else:
-        m3.markdown(
-            kpi("Posición de precio", f"{fmt(diferencia)} por encima",
-                f"▲ +{porcentaje:.1f}%", "bad"),
-            unsafe_allow_html=True,
-        )
+        nombre_ref, c_ref = ref
+        diferencia = mi_precio - c_ref["precio"]
+        porcentaje = diferencia / c_ref["precio"] * 100
+        etiqueta = f"Posición vs. {nombre_ref}"
+        if diferencia < 0:
+            cols[-1].markdown(
+                kpi(etiqueta, f"{fmt(abs(diferencia))} más económicos",
+                    f"▼ {abs(porcentaje):.1f}% (ventaja)", "good"),
+                unsafe_allow_html=True,
+            )
+        else:
+            cols[-1].markdown(
+                kpi(etiqueta, f"{fmt(diferencia)} por encima", f"▲ +{porcentaje:.1f}%", "bad"),
+                unsafe_allow_html=True,
+            )
 
+    # Gráfico
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown('<div class="kia-section">Gráfico comparativo</div>', unsafe_allow_html=True)
 
-    df_grafico = pd.DataFrame({
-        "Entidad": ["Kia (nosotros)", "MS Repuestos"],
-        "Precio": [mi_precio, precio_competidor],
-    })
+    entidades = ["Kia (nosotros)"] + [n for n, c in comps.items() if c["estado"] == "ok" and c.get("precio")]
+    precios = [mi_precio] + [c["precio"] for n, c in comps.items() if c["estado"] == "ok" and c.get("precio")]
+    df_grafico = pd.DataFrame({"Entidad": entidades, "Precio": precios})
+
     fig = px.bar(
         df_grafico, x="Entidad", y="Precio", text_auto="$,.0f", color="Entidad",
-        color_discrete_map={"Kia (nosotros)": NEGRO, "MS Repuestos": ROJO},
+        color_discrete_map={"Kia (nosotros)": NEGRO, "MS Repuestos": ROJO, "Repuestos Boston": GRIS},
     )
     fig.update_layout(
         template="plotly_white", showlegend=False,
@@ -472,41 +634,67 @@ def vista_individual():
 # ---------------------------------------------------------------------------
 # Vista: consulta masiva
 # ---------------------------------------------------------------------------
+def celda_competidor(c: dict, es_ref: bool) -> str:
+    clase = "num best" if es_ref else "num"
+    if c["estado"] == "error":
+        motivo = html.escape(c.get("error", ""))
+        return f'<td class="num"><span class="badge warn" title="{motivo}">Error</span></td>'
+    if c["estado"] == "sin_resultados":
+        return '<td class="num">—</td>'
+    texto = fmt(c["precio"]) + ("" if c.get("exacto") else " ⚠")
+    titulo = html.escape(c.get("titulo", ""))
+    url = html.escape(c.get("url", ""))
+    return f'<td class="{clase}"><a href="{url}" target="_blank" title="{titulo}">{texto}</a></td>'
+
+
 def tabla_html(resultados) -> str:
     clases_pos = {"Más barato": "good", "Más caro": "bad", "Igual": "neutral"}
     filas = []
     for r in resultados:
         pos = r["Posición"]
         pos_badge = f'<span class="badge {clases_pos.get(pos, "warn")}">{html.escape(pos)}</span>'
-
         coin = r["Coincidencia"]
         coin_badge = f'<span class="badge {"good" if coin == "Exacta" else "warn"}">{html.escape(coin)}</span>'
-
-        producto = html.escape(r["Producto"]) if r["Producto"] else "—"
-        if r["URL"]:
-            producto = f'<a href="{html.escape(r["URL"])}" target="_blank">{producto} ↗</a>'
-
         dif_pct = f'{r["Dif %"]:+.1f}%' if r["Dif %"] is not None else "—"
 
+        celdas_comp = "".join(
+            celda_competidor(r["comp"][nombre], r["Referencia"] == nombre) for nombre in COMPETIDORES
+        )
         filas.append(
             "<tr>"
             f'<td><b>{html.escape(r["Código"])}</b></td>'
-            f"<td>{producto}</td>"
             f'<td class="num">{fmt(r["Nuestro precio"])}</td>'
-            f'<td class="num">{fmt(r["MS Repuestos"])}</td>'
+            f"{celdas_comp}"
             f'<td class="num">{fmt_signed(r["Dif $"])}</td>'
             f'<td class="num">{dif_pct}</td>'
             f"<td>{pos_badge}</td>"
             f"<td>{coin_badge}</td>"
-            f'<td>{html.escape(r["Stock"])}</td>'
             "</tr>"
         )
 
     encabezado = (
-        "<tr><th>Código</th><th>Producto (MS Repuestos)</th><th>Nuestro</th><th>MS</th>"
-        "<th>Dif $</th><th>Dif %</th><th>Posición</th><th>Coincidencia</th><th>Stock</th></tr>"
+        "<tr><th>Código</th><th>Nuestro</th>"
+        + "".join(f"<th>{html.escape(n)}</th>" for n in COMPETIDORES)
+        + "<th>Dif $</th><th>Dif %</th><th>Posición</th><th>Coincidencia</th></tr>"
     )
     return f'<div class="tbl-wrap"><table class="tbl">{encabezado}{"".join(filas)}</table></div>'
+
+
+def fila_csv(r: dict) -> dict:
+    out = {"Código": r["Código"], "Nuestro precio": r["Nuestro precio"]}
+    for nombre, c in r["comp"].items():
+        out[f"{nombre} - precio"] = c.get("precio")
+        out[f"{nombre} - producto"] = c.get("titulo") or c.get("error") or ""
+        out[f"{nombre} - coincidencia"] = etiqueta_coincidencia(c)
+        out[f"{nombre} - stock"] = (
+            "Disponible" if c.get("disponible") is True else "Agotado" if c.get("disponible") is False else ""
+        )
+        out[f"{nombre} - url"] = c.get("url", "")
+    out["Competidor de referencia"] = r["Referencia"] or ""
+    out["Dif $"] = r["Dif $"]
+    out["Dif %"] = None if r["Dif %"] is None else round(r["Dif %"], 2)
+    out["Posición"] = r["Posición"]
+    return out
 
 
 def mostrar_resultados(resultados):
@@ -520,8 +708,8 @@ def mostrar_resultados(resultados):
     st.markdown('<div class="kia-section">Resumen</div>', unsafe_allow_html=True)
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.markdown(kpi("Códigos consultados", str(total)), unsafe_allow_html=True)
-    c2.markdown(kpi("Más caros que MS", str(caros)), unsafe_allow_html=True)
-    c3.markdown(kpi("Más baratos que MS", str(baratos)), unsafe_allow_html=True)
+    c2.markdown(kpi("Más caros que el mercado", str(caros)), unsafe_allow_html=True)
+    c3.markdown(kpi("Más baratos que el mercado", str(baratos)), unsafe_allow_html=True)
     c4.markdown(kpi("Sin coincidencia", str(sin_dato)), unsafe_allow_html=True)
     if promedio is None:
         c5.markdown(kpi("Diferencia promedio", "—"), unsafe_allow_html=True)
@@ -535,18 +723,20 @@ def mostrar_resultados(resultados):
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown('<div class="kia-section">Detalle por código</div>', unsafe_allow_html=True)
     st.markdown(tabla_html(resultados), unsafe_allow_html=True)
-
-    if any(r["Coincidencia"] == "Revisar" for r in resultados):
-        st.caption(
-            "Las filas marcadas «Revisar» no contienen el código buscado en el título del producto "
-            "encontrado: abre el enlace y confirma que sea el mismo repuesto antes de usar ese dato."
-        )
+    st.caption(
+        "La comparación (Dif $, Dif %, Posición) es contra el competidor más barato con coincidencia, "
+        "resaltado en verde. Cada precio enlaza a la ficha del competidor. "
+        "Un ⚠ indica que el título del producto no contiene el código buscado: confirma que sea el mismo repuesto."
+    )
 
     # Gráfico de diferencia porcentual
-    con_dif = [r for r in resultados if r["Dif %"] is not None]
+    con_dif = [
+        {"Código": r["Código"], "Dif %": r["Dif %"], "Posición": r["Posición"]}
+        for r in resultados if r["Dif %"] is not None
+    ]
     if con_dif:
         st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown('<div class="kia-section">Diferencia de precio vs. MS Repuestos</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kia-section">Diferencia de precio vs. el mercado</div>', unsafe_allow_html=True)
         df_g = pd.DataFrame(con_dif).sort_values("Dif %", ascending=False)
         df_g["Etiqueta"] = df_g["Dif %"].map(lambda v: f"{v:+.1f}%")
         fig = px.bar(
@@ -566,7 +756,7 @@ def mostrar_resultados(resultados):
         st.plotly_chart(fig, use_container_width=True)
 
     # Descarga
-    df_csv = pd.DataFrame(resultados)
+    df_csv = pd.DataFrame([fila_csv(r) for r in resultados])
     st.download_button(
         "DESCARGAR RESULTADOS (CSV)",
         data=df_csv.to_csv(index=False, sep=";").encode("utf-8-sig"),
@@ -588,7 +778,7 @@ def vista_masiva():
         texto = st.text_area(
             "Códigos OEM y precio",
             height=180,
-            placeholder="641011M000, 54900\n641012M000, 61900\n...",
+            placeholder="641011M000, 54900\n29110C5500, 61900\n...",
         )
         archivo = st.file_uploader("…o sube un archivo", type=["xlsx", "csv"])
         enviar = st.form_submit_button("ANALIZAR LISTA")
@@ -617,7 +807,7 @@ def vista_masiva():
             st.warning("No encontré códigos para consultar.")
         else:
             if archivo is not None and not hay_precio:
-                st.info("No encontré una columna de precio en el archivo: se consultará solo el precio del competidor.")
+                st.info("No encontré una columna de precio en el archivo: se consultará solo el precio de la competencia.")
             if len(items) > MAX_CODIGOS:
                 st.warning(f"Se encontraron {len(items)} códigos; se analizarán solo los primeros {MAX_CODIGOS}.")
                 items = items[:MAX_CODIGOS]
