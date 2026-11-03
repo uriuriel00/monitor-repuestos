@@ -6,7 +6,7 @@ import plotly.express as px
 # 1. Configuración de página
 st.set_page_config(page_title="Kia | Price Intelligence Hub", page_icon="🚗", layout="wide")
 
-# 2. Inyección de CSS Personalizado (Kia Dark)
+# 2. Estilos CSS (Kia Dark)
 st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap');
@@ -17,6 +17,7 @@ st.markdown("""
     .stButton>button { background: linear-gradient(135deg, #C41425 0%, #9E0F1E 100%) !important; color: #FFFFFF !important; border: none !important; border-radius: 8px !important; padding: 0.75rem 2rem !important; width: 100%; font-weight: 700; }
     [data-testid="stMetric"] { background: #111827; padding: 1.25rem; border-radius: 12px; border: 1px solid #1F2937; }
     .product-card { background: #111827; border: 1px solid #1F2937; border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem; }
+    .badge-oem { background: rgba(16, 185, 129, 0.2); color: #10B981; border: 1px solid #10B981; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -42,35 +43,49 @@ with st.form("busqueda_form"):
     
     boton_buscar = st.form_submit_button("ANALIZAR COMPETIDORES")
 
-# 5. Función auxiliar para Mercado Libre
-def buscar_mercadolibre(raw_code):
-    clean_code = raw_code.replace("-", "").replace(" ", "")
+# 5. Función de búsqueda e inspección de Ficha Técnica en Mercado Libre
+def buscar_mercadolibre_por_ficha(raw_code):
+    clean_code = raw_code.replace("-", "").replace(" ", "").upper()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     
-    # Variaciones de búsqueda para cubrir títulos y fichas
-    queries = [
-        raw_code,
-        clean_code,
-        f"Kia {raw_code}",
-        f"Kia {clean_code}",
-        f"alzavidrio Kia {raw_code}"
-    ]
+    queries = [raw_code, clean_code, f"Kia {raw_code}", f"Kia {clean_code}"]
+    candidatos = []
     
     for q in queries:
         try:
             url = f"https://api.mercadolibre.com/sites/MLC/search?q={q}"
-            res = requests.get(url, headers=headers, timeout=5)
+            res = requests.get(url, headers=headers, timeout=6)
             if res.status_code == 200:
                 results = res.json().get("results", [])
                 if results:
-                    return results[0], headers
+                    candidatos.extend(results)
+                    break
         except Exception:
             continue
-    return None, headers
 
-# 6. Ejecución
+    prod_seleccionado = None
+    oem_verificado = False
+    
+    # Inspección de atributos (Ficha técnica)
+    for item in candidatos:
+        attributes = item.get("attributes", [])
+        for attr in attributes:
+            val_attr = str(attr.get("value_name", "")).replace("-", "").replace(" ", "").upper()
+            if clean_code in val_attr and len(clean_code) > 3:
+                prod_seleccionado = item
+                oem_verificado = True
+                break
+        if oem_verificado:
+            break
+            
+    if not prod_seleccionado and candidatos:
+        prod_seleccionado = candidatos[0]
+        
+    return prod_seleccionado, oem_verificado, headers
+
+# 6. Ejecución del análisis
 if boton_buscar:
     raw_code = codigo_oem_input.strip()
     clean_code = raw_code.replace("-", "").replace(" ", "")
@@ -78,10 +93,10 @@ if boton_buscar:
     if not raw_code:
         st.warning("Por favor ingresa un código OEM válido.")
     else:
-        with st.spinner("Escaneando catálogos de MS Repuestos y Mercado Libre..."):
+        with st.spinner("Escaneando catálogos y fichas técnicas..."):
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
             
-            # --- COMPETIDOR 1: MS REPUESTOS ---
+            # --- MS REPUESTOS ---
             precio_ms, titulo_ms, url_ms = None, None, None
             try:
                 url_ms_suggest = f"https://www.msrepuestos.cl/search/suggest.json?q={clean_code}&resources[type]=product"
@@ -96,11 +111,11 @@ if boton_buscar:
             except Exception as e:
                 st.error(f"Error en MS Repuestos: {e}")
 
-            # --- COMPETIDOR 2: MERCADO LIBRE CHILE ---
+            # --- MERCADO LIBRE ---
             precio_meli, titulo_meli, url_meli = None, None, None
             vendedor_nombre = "Mercado Libre"
             
-            prod_sel, meli_headers = buscar_mercadolibre(raw_code)
+            prod_sel, es_verificado, meli_headers = buscar_mercadolibre_por_ficha(raw_code)
 
             if prod_sel:
                 s_id = prod_sel.get("seller", {}).get("id")
@@ -118,7 +133,7 @@ if boton_buscar:
                 titulo_meli = prod_sel.get("title", "Producto MeLi")
                 url_meli = prod_sel.get("permalink", "")
 
-            # --- RENDERIZADO DE RESULTADOS ---
+            # --- PRESENTACIÓN DE RESULTADOS ---
             st.markdown("<br>", unsafe_allow_html=True)
             st.markdown("##### 📦 Coincidencias Detectadas")
             
@@ -137,15 +152,19 @@ if boton_buscar:
 
             with c_info2:
                 if precio_meli:
+                    badge_html = '<span class="badge-oem">OEM Verificado en Ficha Técnica</span>' if es_verificado else ''
                     st.markdown(f"""
                         <div class="product-card">
-                            <span style="color: #F59E0B; font-size: 0.75rem; font-weight: 700;">{vendedor_nombre.upper()}</span>
-                            <h4 style="color: #FFFFFF; margin: 4px 0;">{titulo_meli}</h4>
-                            <a href="{url_meli}" target="_blank" style="color: #9CA3AF; font-size: 0.85rem;">Ver en Mercado Libre ↗</a>
+                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                <span style="color: #F59E0B; font-size: 0.75rem; font-weight: 700;">{vendedor_nombre.upper()}</span>
+                                {badge_html}
+                            </div>
+                            <h4 style="color: #FFFFFF; margin: 6px 0 4px 0;">{titulo_meli}</h4>
+                            <a href="{url_meli}" target="_blank" style="color: #9CA3AF; font-size: 0.85rem;">Ver publicación original ↗</a>
                         </div>
                     """, unsafe_allow_html=True)
                 else:
-                    st.warning("Sin coincidencia directa por título en Mercado Libre. (El vendedor publicó el repuesto sin el código OEM en el título).")
+                    st.warning("Sin coincidencia detectada en Mercado Libre.")
 
             # --- MÉTRICAS ---
             st.markdown("<br>", unsafe_allow_html=True)
@@ -166,7 +185,7 @@ if boton_buscar:
             else:
                 m3.metric("Mercado Libre", "N/D")
 
-            # --- GRÁFICO ---
+            # --- GRÁFICO COMPARATIVO ---
             datos_grafico = [{"Entidad": "Kia (Nosotros)", "Precio": mi_precio}]
             color_map = {"Kia (Nosotros)": "#3B82F6"}
             
