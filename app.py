@@ -32,6 +32,19 @@ def logo_html(path: str, alto: int, color_fallback: str) -> str:
     return f'<span style="font-weight:800;font-size:{alto}px;color:{color_fallback};letter-spacing:1px;">Kia</span>'
 
 
+def fmt(n: float) -> str:
+    """Formato CLP con punto como separador de miles: $54.900"""
+    return f"${n:,.0f}".replace(",", ".")
+
+
+def kpi(label: str, valor: str, delta: str = "", clase: str = "") -> str:
+    delta_html = f'<div class="delta {clase}">{delta}</div>' if delta else ""
+    return (
+        f'<div class="kpi"><div class="label">{label}</div>'
+        f'<div class="value">{valor}</div>{delta_html}</div>'
+    )
+
+
 # 2. CSS personalizado (estilo claro, inspirado en kia.cl)
 st.markdown("""
 <style>
@@ -116,13 +129,16 @@ label, .stTextInput label p, .stNumberInput label p { font-weight: 600 !importan
 .product-card a { color: #BB162B; text-decoration: none; font-size: .9rem; font-weight: 600; }
 .product-card a:hover { text-decoration: underline; }
 
-/* Métricas */
-[data-testid="stMetric"] {
-    background: #FFFFFF; padding: 1.25rem; border-radius: 8px;
-    border: 1px solid #E5E7EB; box-shadow: 0 2px 12px rgba(5, 20, 31, 0.05);
+/* Tarjetas KPI (reemplazo de st.metric) */
+.kpi {
+    background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 8px;
+    padding: 1.25rem; box-shadow: 0 2px 12px rgba(5, 20, 31, 0.05);
 }
-[data-testid="stMetricLabel"] { color: #6B7280 !important; font-size: .85rem !important; font-weight: 500; }
-[data-testid="stMetricValue"] { color: #05141F !important; font-weight: 700 !important; }
+.kpi .label { color: #6B7280; font-size: .85rem; font-weight: 500; }
+.kpi .value { color: #05141F; font-size: 1.9rem; font-weight: 700; margin: .25rem 0; line-height: 1.2; }
+.kpi .delta { font-size: .85rem; font-weight: 600; }
+.kpi .delta.good { color: #16A34A; }
+.kpi .delta.bad { color: #BB162B; }
 
 /* Footer */
 .kia-footer {
@@ -218,25 +234,30 @@ if boton_buscar:
 </div>
 """, unsafe_allow_html=True)
 
-                        # Métricas
+                        # Métricas (HTML, sin componentes externos)
                         m1, m2, m3 = st.columns(3)
-                        m1.metric("Nuestro precio", f"${mi_precio:,.0f}")
-                        m2.metric("MS Repuestos", f"${precio_competidor:,.0f}")
+                        m1.markdown(kpi("Nuestro precio", fmt(mi_precio)), unsafe_allow_html=True)
+                        m2.markdown(kpi("MS Repuestos", fmt(precio_competidor)), unsafe_allow_html=True)
 
-                        # delta_color="inverse": bajar el precio vs. la competencia = verde
                         if diferencia < 0:
-                            m3.metric(
-                                "Posición de precio",
-                                f"${abs(diferencia):,.0f} más económicos",
-                                delta=f"{porcentaje:.1f}% (ventaja)",
-                                delta_color="inverse",
+                            m3.markdown(
+                                kpi(
+                                    "Posición de precio",
+                                    f"{fmt(abs(diferencia))} más económicos",
+                                    f"▼ {abs(porcentaje):.1f}% (ventaja)",
+                                    "good",
+                                ),
+                                unsafe_allow_html=True,
                             )
                         else:
-                            m3.metric(
-                                "Posición de precio",
-                                f"${diferencia:,.0f} por encima",
-                                delta=f"+{porcentaje:.1f}%",
-                                delta_color="inverse",
+                            m3.markdown(
+                                kpi(
+                                    "Posición de precio",
+                                    f"{fmt(diferencia)} por encima",
+                                    f"▲ +{porcentaje:.1f}%",
+                                    "bad",
+                                ),
+                                unsafe_allow_html=True,
                             )
 
                         # Gráfico
