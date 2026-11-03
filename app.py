@@ -31,7 +31,7 @@ st.markdown("""
     </div>
 """, unsafe_allow_html=True)
 
-# 4. Formulario de Búsqueda (Sin campo de entrada de vendedor)
+# 4. Formulario de Búsqueda
 st.markdown("##### 🔍 Consulta de Coincidencia de Precios")
 with st.form("busqueda_form"):
     col1, col2 = st.columns([2, 1])
@@ -42,7 +42,35 @@ with st.form("busqueda_form"):
     
     boton_buscar = st.form_submit_button("ANALIZAR COMPETIDORES")
 
-# 5. Ejecución
+# 5. Función auxiliar para Mercado Libre
+def buscar_mercadolibre(raw_code):
+    clean_code = raw_code.replace("-", "").replace(" ", "")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    # Variaciones de búsqueda para cubrir títulos y fichas
+    queries = [
+        raw_code,
+        clean_code,
+        f"Kia {raw_code}",
+        f"Kia {clean_code}",
+        f"alzavidrio Kia {raw_code}"
+    ]
+    
+    for q in queries:
+        try:
+            url = f"https://api.mercadolibre.com/sites/MLC/search?q={q}"
+            res = requests.get(url, headers=headers, timeout=5)
+            if res.status_code == 200:
+                results = res.json().get("results", [])
+                if results:
+                    return results[0], headers
+        except Exception:
+            continue
+    return None, headers
+
+# 6. Ejecución
 if boton_buscar:
     raw_code = codigo_oem_input.strip()
     clean_code = raw_code.replace("-", "").replace(" ", "")
@@ -57,7 +85,7 @@ if boton_buscar:
             precio_ms, titulo_ms, url_ms = None, None, None
             try:
                 url_ms_suggest = f"https://www.msrepuestos.cl/search/suggest.json?q={clean_code}&resources[type]=product"
-                res_ms = requests.get(url_ms_suggest, headers=headers, timeout=10)
+                res_ms = requests.get(url_ms_suggest, headers=headers, timeout=8)
                 if res_ms.status_code == 200:
                     prods_ms = res_ms.json().get("resources", {}).get("results", {}).get("products", [])
                     if prods_ms:
@@ -72,34 +100,18 @@ if boton_buscar:
             precio_meli, titulo_meli, url_meli = None, None, None
             vendedor_nombre = "Mercado Libre"
             
-            queries_to_try = [raw_code, clean_code, f"Kia {raw_code}", f"Kia {clean_code}"]
-            prods_meli = []
-            
-            for q in queries_to_try:
-                try:
-                    url_search = f"https://api.mercadolibre.com/sites/MLC/search?q={q}"
-                    res_m = requests.get(url_search, headers=headers, timeout=8)
-                    if res_m.status_code == 200:
-                        res_json = res_m.json().get("results", [])
-                        if res_json:
-                            prods_meli = res_json
-                            break
-                except:
-                    continue
+            prod_sel, meli_headers = buscar_mercadolibre(raw_code)
 
-            if prods_meli:
-                prod_sel = prods_meli[0]
+            if prod_sel:
                 s_id = prod_sel.get("seller", {}).get("id")
-                
-                # Obtención automática del nickname del vendedor
                 if s_id:
                     try:
-                        u_res = requests.get(f"https://api.mercadolibre.com/users/{s_id}", headers=headers, timeout=4)
+                        u_res = requests.get(f"https://api.mercadolibre.com/users/{s_id}", headers=meli_headers, timeout=4)
                         if u_res.status_code == 200:
                             nick = u_res.json().get("nickname", "")
                             if nick:
                                 vendedor_nombre = f"MeLi ({nick})"
-                    except:
+                    except Exception:
                         vendedor_nombre = f"MeLi (ID: {s_id})"
 
                 precio_meli = float(prod_sel.get("price", 0))
@@ -133,7 +145,7 @@ if boton_buscar:
                         </div>
                     """, unsafe_allow_html=True)
                 else:
-                    st.warning("Sin coincidencia en Mercado Libre")
+                    st.warning("Sin coincidencia directa por título en Mercado Libre. (El vendedor publicó el repuesto sin el código OEM en el título).")
 
             # --- MÉTRICAS ---
             st.markdown("<br>", unsafe_allow_html=True)
