@@ -111,14 +111,13 @@ st.markdown("""
         font-weight: 700 !important;
     }
 
-    /* Contenedor Ficha Producto */
+    /* Contenedores de Ficha Producto */
     .product-card {
         background: #111827;
         border: 1px solid #1F2937;
         border-radius: 12px;
-        padding: 1.5rem;
-        margin-top: 1.5rem;
-        margin-bottom: 1.5rem;
+        padding: 1.25rem;
+        margin-bottom: 1rem;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -128,23 +127,25 @@ st.markdown("""
     <div class="kia-navbar">
         <div>
             <div class="kia-brand">K I A</div>
-            <div class="kia-subhead">PARTS PRICE INTELLIGENCE HUB</div>
+            <div class="kia-subhead">MULTI-COMPETITOR PRICE INTELLIGENCE HUB</div>
         </div>
-        <div class="kia-tag">LIVE COMPETITOR TRACKER</div>
+        <div class="kia-tag">LIVE TRACKER (MS + MERCADO LIBRE)</div>
     </div>
 """, unsafe_allow_html=True)
 
-# 4. Formulario de Búsqueda
+# 4. Formulario de Búsqueda Multi-Competidor
 st.markdown("##### 🔍 Consulta de Coincidencia de Precios")
 
 with st.form("busqueda_form"):
-    col1, col2 = st.columns([2, 1])
+    col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
         codigo_oem = st.text_input("Código OEM del Repuesto", value="641011M000")
     with col2:
         mi_precio = st.number_input("Nuestro Precio ($ CLP)", value=54900, step=1000)
+    with col3:
+        vendedor_meli_filtro = st.text_input("Vendedor MeLi (Opcional)", value="", placeholder="Ej: REPUESTOS_EXPRESS")
     
-    boton_buscar = st.form_submit_button("ANALIZAR PRECIO COMPETIDOR")
+    boton_buscar = st.form_submit_button("ANALIZAR COMPETIDORES")
 
 # 5. Ejecución y Renderizado
 if boton_buscar:
@@ -152,84 +153,152 @@ if boton_buscar:
     if not codigo_limpio:
         st.warning("Por favor ingresa un código OEM válido.")
     else:
-        with st.spinner("Escaneando catálogo del competidor en tiempo real..."):
-            url_suggest = f"https://www.msrepuestos.cl/search/suggest.json?q={codigo_limpio}&resources[type]=product"
+        with st.spinner("Escaneando catálogos de MS Repuestos y Mercado Libre..."):
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             }
             
+            # --- COMPETIDOR 1: MS REPUESTOS (Shopify API) ---
+            precio_ms = None
+            titulo_ms = None
+            url_ms = None
+            
             try:
-                res = requests.get(url_suggest, headers=headers, timeout=10)
-                if res.status_code == 200:
-                    data = res.json()
-                    productos = data.get("resources", {}).get("results", {}).get("products", [])
-                    
-                    if productos:
-                        prod = productos[0]
-                        precio_competidor = float(prod.get("price", 0))
-                        titulo_prod = prod.get("title", "Producto encontrado")
-                        url_prod = "https://www.msrepuestos.cl" + prod.get("url", "")
-                        
-                        diferencia = mi_precio - precio_competidor
-                        porcentaje = (diferencia / precio_competidor) * 100 if precio_competidor > 0 else 0
-                        
-                        # Ficha del Repuesto
-                        st.markdown(f"""
-                            <div class="product-card">
-                                <span style="color: #9CA3AF; font-size: 0.8rem; text-transform: uppercase;">Coincidencia Detectada</span>
-                                <h3 style="color: #FFFFFF; margin-top: 4px; margin-bottom: 8px;">{titulo_prod}</h3>
-                                <a href="{url_prod}" target="_blank" style="color: #EF4444; text-decoration: none; font-size: 0.9rem; font-weight: 600;"> Ver ficha original en la web del competidor ↗</a>
-                            </div>
-                        """, unsafe_allow_html=True)
-                        
-                        # Métricas Comparativas
-                        m1, m2, m3 = st.columns(3)
-                        m1.metric("Nuestro Precio", f"${mi_precio:,.0f}")
-                        m2.metric("MS Repuestos", f"${precio_competidor:,.0f}")
-                        
-                        if diferencia < 0:
-                            m3.metric("Posición de Precio", f"${abs(diferencia):,.0f} más económicos", delta=f"{porcentaje:.1f}% (Ventaja)")
-                        else:
-                            m3.metric("Posición de Precio", f"${diferencia:,.0f} por encima", delta=f"+{porcentaje:.1f}%", delta_color="inverse")
-                        
-                        # Gráfico Interactivo Visual
-                        st.markdown("<br>", unsafe_allow_html=True)
-                        st.markdown("##### 📈 Gráfico Comparativo")
-                        
-                        df_grafico = pd.DataFrame({
-                            "Entidad": ["Kia (Nosotros)", "Competencia (MS)"],
-                            "Precio": [mi_precio, precio_competidor]
-                        })
-                        
-                        fig = px.bar(
-                            df_grafico, 
-                            x="Entidad", 
-                            y="Precio",
-                            text_auto="$,.0f",
-                            color="Entidad",
-                            color_discrete_map={
-                                "Kia (Nosotros)": "#3B82F6",
-                                "Competencia (MS)": "#C41425"
-                            }
-                        )
-                        fig.update_layout(
-                            showlegend=False,
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            font=dict(family="Inter, sans-serif", size=13, color="#9CA3AF"),
-                            xaxis=dict(showgrid=False, title=""),
-                            yaxis=dict(showgrid=True, gridcolor="#1F2937", title=""),
-                            margin=dict(l=20, r=20, t=20, b=20)
-                        )
-                        fig.update_traces(
-                            textposition="outside",
-                            textfont=dict(color="#FFFFFF", size=14),
-                            marker_line_width=0
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.warning(f"No se encontraron productos coincidentes para el código OEM '{codigo_limpio}'.")
-                else:
-                    st.error(f"Respuesta inesperada del servidor ({res.status_code}).")
+                url_ms_suggest = f"https://www.msrepuestos.cl/search/suggest.json?q={codigo_limpio}&resources[type]=product"
+                res_ms = requests.get(url_ms_suggest, headers=headers, timeout=10)
+                if res_ms.status_code == 200:
+                    prods_ms = res_ms.json().get("resources", {}).get("results", {}).get("products", [])
+                    if prods_ms:
+                        prod_ms = prods_ms[0]
+                        precio_ms = float(prod_ms.get("price", 0))
+                        titulo_ms = prod_ms.get("title", "Producto MS")
+                        url_ms = "https://www.msrepuestos.cl" + prod_ms.get("url", "")
             except Exception as e:
-                st.error(f"Error en la ejecución de la consulta: {e}")
+                st.error(f"Error al consultar MS Repuestos: {e}")
+
+            # --- COMPETIDOR 2: MERCADO LIBRE CHILE (MLC API) ---
+            precio_meli = None
+            titulo_meli = None
+            url_meli = None
+            vendedor_nombre = "Mercado Libre"
+            
+            try:
+                url_meli_search = f"https://api.mercadolibre.com/sites/MLC/search?q={codigo_limpio}"
+                res_meli = requests.get(url_meli_search, headers=headers, timeout=10)
+                if res_meli.status_code == 200:
+                    prods_meli = res_meli.json().get("results", [])
+                    if prods_meli:
+                        prod_seleccionado = None
+                        
+                        # Si el usuario especificó un vendedor, buscar coincidencia
+                        if vendedor_meli_filtro.strip():
+                            filtro_str = vendedor_meli_filtro.strip().lower()
+                            for item in prods_meli:
+                                nickname = item.get("seller", {}).get("nickname", "").lower()
+                                if filtro_str in nickname:
+                                    prod_seleccionado = item
+                                    vendedor_nombre = f"MeLi ({item.get('seller', {}).get('nickname')})"
+                                    break
+                        
+                        # Si no hay filtro o no se encontró el vendedor específico, tomar el primer resultado (mejor/más relevante)
+                        if not prod_seleccionado:
+                            prod_seleccionado = prods_meli[0]
+                            seller_nick = prod_seleccionado.get("seller", {}).get("nickname", "Vendedor MeLi")
+                            vendedor_nombre = f"MeLi ({seller_nick})"
+                        
+                        precio_meli = float(prod_seleccionado.get("price", 0))
+                        titulo_meli = prod_seleccionado.get("title", "Producto MeLi")
+                        url_meli = prod_seleccionado.get("permalink", "")
+            except Exception as e:
+                st.error(f"Error al consultar Mercado Libre: {e}")
+
+            # --- DESPLIEGUE DE RESULTADOS ---
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown("##### 📦 Coincidencias Detectadas")
+            
+            col_info1, col_info2 = st.columns(2)
+            with col_info1:
+                if precio_ms:
+                    st.markdown(f"""
+                        <div class="product-card">
+                            <span style="color: #EF4444; font-size: 0.75rem; font-weight: 700; text-transform: uppercase;">MS Repuestos</span>
+                            <h4 style="color: #FFFFFF; margin-top: 4px; margin-bottom: 6px; font-size: 1rem;">{titulo_ms}</h4>
+                            <a href="{url_ms}" target="_blank" style="color: #9CA3AF; text-decoration: none; font-size: 0.85rem;"> Ver en sitio web ↗</a>
+                        </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.warning("Sin coincidencia en MS Repuestos")
+
+            with col_info2:
+                if precio_meli:
+                    st.markdown(f"""
+                        <div class="product-card">
+                            <span style="color: #F59E0B; font-size: 0.75rem; font-weight: 700; text-transform: uppercase;">{vendedor_nombre}</span>
+                            <h4 style="color: #FFFFFF; margin-top: 4px; margin-bottom: 6px; font-size: 1rem;">{titulo_meli}</h4>
+                            <a href="{url_meli}" target="_blank" style="color: #9CA3AF; text-decoration: none; font-size: 0.85rem;"> Ver en Mercado Libre ↗</a>
+                        </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.warning("Sin coincidencia en Mercado Libre")
+
+            # --- MÉTRICAS COMPARATIVAS ---
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown("##### 💰 Comparativa de Precios")
+            
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Kia (Nuestro Precio)", f"${mi_precio:,.0f}")
+            
+            if precio_ms:
+                dif_ms = mi_precio - precio_ms
+                pct_ms = (dif_ms / precio_ms) * 100
+                m2.metric("MS Repuestos", f"${precio_ms:,.0f}", delta=f"{pct_ms:+.1f}% vs Kia", delta_color="inverse" if dif_ms > 0 else "normal")
+            else:
+                m2.metric("MS Repuestos", "N/D")
+                
+            if precio_meli:
+                dif_meli = mi_precio - precio_meli
+                pct_meli = (dif_meli / precio_meli) * 100
+                m3.metric(vendedor_nombre, f"${precio_meli:,.0f}", delta=f"{pct_meli:+.1f}% vs Kia", delta_color="inverse" if dif_meli > 0 else "normal")
+            else:
+                m3.metric("Mercado Libre", "N/D")
+
+            # --- GRÁFICO COMPARATIVO VISUAL ---
+            datos_grafico = [{"Entidad": "Kia (Nosotros)", "Precio": mi_precio}]
+            color_map = {"Kia (Nosotros)": "#3B82F6"}
+            
+            if precio_ms:
+                datos_grafico.append({"Entidad": "MS Repuestos", "Precio": precio_ms})
+                color_map["MS Repuestos"] = "#C41425"
+                
+            if precio_meli:
+                datos_grafico.append({"Entidad": vendedor_nombre, "Precio": precio_meli})
+                color_map[vendedor_nombre] = "#F59E0B"
+                
+            df_grafico = pd.DataFrame(datos_grafico)
+            
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown("##### 📈 Gráfico Comparativo Multi-Competidor")
+            
+            fig = px.bar(
+                df_grafico, 
+                x="Entidad", 
+                y="Precio",
+                text_auto="$,.0f",
+                color="Entidad",
+                color_discrete_map=color_map
+            )
+            fig.update_layout(
+                showlegend=False,
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(family="Inter, sans-serif", size=13, color="#9CA3AF"),
+                xaxis=dict(showgrid=False, title=""),
+                yaxis=dict(showgrid=True, gridcolor="#1F2937", title=""),
+                margin=dict(l=20, r=20, t=20, b=20)
+            )
+            fig.update_traces(
+                textposition="outside",
+                textfont=dict(color="#FFFFFF", size=14),
+                marker_line_width=0
+            )
+            st.plotly_chart(fig, use_container_width=True)
