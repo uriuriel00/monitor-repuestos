@@ -5,7 +5,7 @@ import plotly.express as px
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------------------------------------------------
-# 1. Configuración de página
+# 1. Configuración de la Aplicación y Tema Kia Dark
 # ---------------------------------------------------------
 st.set_page_config(
     page_title="Kia | Price Intelligence Hub", 
@@ -13,9 +13,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# ---------------------------------------------------------
-# 2. Inyección de CSS Personalizado (Estética Kia Dark)
-# ---------------------------------------------------------
 st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap');
@@ -29,6 +26,7 @@ st.markdown("""
         color: #F3F4F6;
     }
     
+    /* Header Corporativo Kia */
     .kia-navbar {
         background: #05141F;
         border-bottom: 3px solid #C41425;
@@ -65,6 +63,7 @@ st.markdown("""
         letter-spacing: 1px;
     }
 
+    /* Campos de Entrada */
     .stTextInput input, .stNumberInput input {
         background-color: #111827 !important;
         color: #FFFFFF !important;
@@ -72,7 +71,12 @@ st.markdown("""
         border-radius: 8px !important;
         padding: 0.6rem 1rem !important;
     }
+    .stTextInput input:focus, .stNumberInput input:focus {
+        border-color: #C41425 !important;
+        box-shadow: 0 0 0 1px #C41425 !important;
+    }
     
+    /* Botón Principal */
     .stButton>button {
         background: linear-gradient(135deg, #C41425 0%, #9E0F1E 100%) !important;
         color: #FFFFFF !important;
@@ -90,6 +94,7 @@ st.markdown("""
         box-shadow: 0 6px 20px rgba(196, 20, 37, 0.6);
     }
 
+    /* Métricas */
     [data-testid="stMetric"] {
         background: #111827;
         padding: 1.25rem;
@@ -106,6 +111,7 @@ st.markdown("""
         font-weight: 700 !important;
     }
 
+    /* Tarjetas de Producto */
     .product-card {
         background: #111827;
         border: 1px solid #1F2937;
@@ -117,31 +123,26 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------
-# 3. Configuración del Catálogo de Competidores
+# 2. Configuración de Competidores
 # ---------------------------------------------------------
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-COMPETIDORES = [
+# Tiendas basadas en Shopify u otras plataformas
+COMPETIDORES_SHOPIFY = [
     {
         "nombre": "MS Repuestos",
-        "tipo": "shopify",
         "url_base": "https://www.msrepuestos.cl"
-    },
-    {
-        "nombre": "Competidor B (Ejemplo Shopify)",
-        "tipo": "shopify",
-        "url_base": "https://tiendaejemplo.cl" # Reemplazar con URL real de tienda Shopify
-    },
-    # Agrega aquí más competidores que usen Shopify o APIs personalizadas
+    }
+    # Agrega más tiendas Shopify aquí siguiendo este mismo formato
 ]
 
 # ---------------------------------------------------------
-# 4. Funciones de Extracción Móduclares & Concurrencia
+# 3. Funciones de Extracción por Plataforma
 # ---------------------------------------------------------
 def consultar_shopify(competidor, codigo_oem):
-    """Consulta la API Ajax estándar de tiendas construidas sobre Shopify."""
+    """Búsqueda Ajax en tiendas basadas en Shopify."""
     url = f"{competidor['url_base']}/search/suggest.json?q={codigo_oem}&resources[type]=product"
     try:
         resp = requests.get(url, headers=HEADERS, timeout=7)
@@ -160,22 +161,67 @@ def consultar_shopify(competidor, codigo_oem):
                 }
     except Exception:
         pass
+    
     return {
         "Competidor": competidor["nombre"],
-        "Estado": "No disponible / Sin stock",
+        "Estado": "Sin coincidencia",
         "Producto": "N/A",
         "Precio": None,
         "URL": "#"
     }
 
-def obtener_datos_competidores_paralelo(codigo_oem):
-    """Ejecuta consultas concurrentes para no bloquear la interfaz."""
+def consultar_mercadolibre(codigo_oem, site_id="MLC"):
+    """
+    Búsqueda profunda en Mercado Libre (Indexa Ficha Técnica y Atributos OEM).
+    Toma la opción con menor precio entre los vendedores activos.
+    """
+    url = f"https://api.mercadolibre.com/sites/{site_id}/search?q={codigo_oem}"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=7)
+        if resp.status_code == 200:
+            data = resp.json()
+            resultados = data.get("results", [])
+            
+            # Filtrar productos con precio válido
+            productos_validos = [p for p in resultados if p.get("price")]
+            if productos_validos:
+                # Ordenar por menor precio
+                productos_validos.sort(key=lambda x: x["price"])
+                mejor_opcion = productos_validos[0]
+                cant_vendedores = len(productos_validos)
+                
+                titulo = f"{mejor_opcion.get('title')} ({cant_vendedores} vendedor{'es' if cant_vendedores > 1 else ''} en MeLi)"
+                
+                return {
+                    "Competidor": "Mercado Libre",
+                    "Estado": "Encontrado",
+                    "Producto": titulo,
+                    "Precio": float(mejor_opcion.get("price")),
+                    "URL": mejor_opcion.get("permalink", "#")
+                }
+    except Exception:
+        pass
+
+    return {
+        "Competidor": "Mercado Libre",
+        "Estado": "Sin coincidencia",
+        "Producto": "N/A",
+        "Precio": None,
+        "URL": "#"
+    }
+
+def obtener_datos_paralelo(codigo_oem):
+    """Ejecuta todas las llamadas en paralelo para máxima velocidad."""
     resultados = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         futures = []
-        for comp in COMPETIDORES:
-            if comp["tipo"] == "shopify":
-                futures.append(executor.submit(consultar_shopify, comp, codigo_oem))
+        
+        # 1. Llamada a Mercado Libre
+        futures.append(executor.submit(consultar_mercadolibre, codigo_oem))
+        
+        # 2. Llamadas a tiendas Shopify
+        for comp in COMPETIDORES_SHOPIFY:
+            futures.append(executor.submit(consultar_shopify, comp, codigo_oem))
         
         for future in as_completed(futures):
             resultados.append(future.result())
@@ -183,7 +229,7 @@ def obtener_datos_competidores_paralelo(codigo_oem):
     return resultados
 
 # ---------------------------------------------------------
-# 5. Encabezado Corporativo
+# 4. Interface Gráfica Streamlit
 # ---------------------------------------------------------
 st.markdown("""
     <div class="kia-navbar">
@@ -195,60 +241,55 @@ st.markdown("""
     </div>
 """, unsafe_allow_html=True)
 
-# ---------------------------------------------------------
-# 6. Formulario de Búsqueda
-# ---------------------------------------------------------
 st.markdown("##### 🔍 Consulta Multi-Mercado de Repuestos")
 
 with st.form("busqueda_form"):
     col1, col2 = st.columns([2, 1])
     with col1:
-        codigo_oem = st.text_input("Código OEM del Repuesto", value="641011M000")
+        codigo_oem = st.text_input("Código OEM del Repuesto", value="93575-1Y000")
     with col2:
         mi_precio = st.number_input("Nuestro Precio ($ CLP)", value=54900, step=1000)
     
     boton_buscar = st.form_submit_button("ESCANEAR TODO EL MERCADO")
 
 # ---------------------------------------------------------
-# 7. Procesamiento y Resultados
+# 5. Ejecución del Escaneo y Presentación de Datos
 # ---------------------------------------------------------
 if boton_buscar:
     codigo_limpio = codigo_oem.strip()
     if not codigo_limpio:
         st.warning("Por favor ingresa un código OEM válido.")
     else:
-        with st.spinner("Escaneando catálogos de competidores en paralelo..."):
-            resultados = obtener_datos_competidores_paralelo(codigo_limpio)
+        with st.spinner("Escaneando Mercado Libre y tiendas del sector en paralelo..."):
+            resultados = obtener_datos_paralelo(codigo_limpio)
             df_resultados = pd.DataFrame(resultados)
             
-            # Filtrar competidores con coincidencia
+            # Filtrar competidores donde sí se encontró el repuesto
             df_encontrados = df_resultados[df_resultados["Precio"].notnull()].copy()
             
             if not df_encontrados.empty:
                 precio_minimo = df_encontrados["Precio"].min()
-                precio_promedio = df_encontrados["Precio"].mean()
                 diferencia_min = mi_precio - precio_minimo
                 pct_min = (diferencia_min / precio_minimo) * 100 if precio_minimo > 0 else 0
                 
-                # Métricas Resumen
+                # Fila de Métricas Principales
                 m1, m2, m3 = st.columns(3)
                 m1.metric("Nuestro Precio (Kia)", f"${mi_precio:,.0f}")
                 m2.metric("Mínimo del Mercado", f"${precio_minimo:,.0f}")
                 
                 if diferencia_min <= 0:
-                    m3.metric("Posición de Liderazgo", f"${abs(diferencia_min):,.0f} más bajo", delta=f"{pct_min:.1f}% (Mejor opción)")
+                    m3.metric("Posición de Precio", f"${abs(diferencia_min):,.0f} más bajo", delta=f"{pct_min:.1f}% (Mejor Opción)")
                 else:
-                    m3.metric("Brecha vs Mínimo", f"${diferencia_min:,.0f} por encima", delta=f"+{pct_min:.1f}%", delta_color="inverse")
+                    m3.metric("Posición de Precio", f"${diferencia_min:,.0f} por encima", delta=f"+{pct_min:.1f}%", delta_color="inverse")
                 
                 st.markdown("<br>", unsafe_allow_html=True)
                 
-                # Gráfico Comparativo Multicompetidor
+                # Gráfico y Detalle en Dos Columnas
                 col_chart, col_list = st.columns([1.2, 1])
                 
                 with col_chart:
                     st.markdown("##### 📈 Comparativa de Precios por Competidor")
                     
-                    # Estructurar DataFrame para Plotly
                     filas_grafico = [{"Entidad": "Kia (Nosotros)", "Precio": mi_precio, "Tipo": "Propio"}]
                     for _, row in df_encontrados.iterrows():
                         filas_grafico.append({
@@ -283,29 +324,3 @@ if boton_buscar:
                         textfont=dict(color="#FFFFFF", size=13)
                     )
                     st.plotly_chart(fig, use_container_width=True)
-                
-                with col_list:
-                    st.markdown("##### 🛒 Detalle por Tienda")
-                    for _, r in df_resultados.iterrows():
-                        if r["Precio"] is not None:
-                            st.markdown(f"""
-                                <div class="product-card">
-                                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                                        <strong style="color: #FFFFFF;">{r['Competidor']}</strong>
-                                        <span style="color: #EF4444; font-weight: 700;">${r['Precio']:,.0f}</span>
-                                    </div>
-                                    <div style="color: #9CA3AF; font-size: 0.85rem; margin-top: 4px;">{r['Producto']}</div>
-                                    <a href="{r['URL']}" target="_blank" style="color: #60A5FA; font-size: 0.8rem; text-decoration: none;">Ver repuesto ↗</a>
-                                </div>
-                            """, unsafe_allow_html=True)
-                        else:
-                            st.markdown(f"""
-                                <div class="product-card" style="opacity: 0.5;">
-                                    <div style="display: flex; justify-content: space-between;">
-                                        <strong style="color: #9CA3AF;">{r['Competidor']}</strong>
-                                        <span style="color: #6B7280;">Sin Coincidencia</span>
-                                    </div>
-                                </div>
-                            """, unsafe_allow_html=True)
-            else:
-                st.warning(f"No se encontraron coincidencias para el código OEM '{codigo_limpio}' en ninguno de los competidores registrados.")
