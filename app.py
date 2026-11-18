@@ -26,8 +26,12 @@ NEGRO = "#05141F"
 ROJO = "#BB162B"
 GRIS = "#64748B"
 
-MAX_CODIGOS = 20   # máximo de códigos por consulta masiva
-PAUSA = 0.5        # segundos entre códigos, para no saturar a los competidores
+MAX_CODIGOS = 200        # máximo de códigos por consulta masiva
+PAUSA = 1.0              # segundos entre códigos, para no saturar a los competidores
+REINTENTOS = 2           # reintentos ante 429/503
+ESPERA_REINTENTO = 3     # segundos base de espera (se multiplica por el nº de intento)
+CACHE_TTL = 1800         # segundos que se guardan los resultados por código
+MAX_GRAFICO = 40         # máximo de códigos que se dibujan en el gráfico masivo
 
 # Repuestos Boston (parece una tienda Magento; ajusta esta URL si su buscador es distinto).
 # {q} se reemplaza por el código buscado.
@@ -105,11 +109,22 @@ def limpiar_precio(valor):
 # HTTP y lectura de fichas de producto
 # ---------------------------------------------------------------------------
 def _get(url: str, params=None):
-    """GET con errores legibles. Si el sitio bloquea la consulta, se informa (no se intenta evadir)."""
-    try:
-        res = requests.get(url, params=params, headers=HEADERS, timeout=12)
-    except requests.RequestException as e:
-        raise RuntimeError(f"No se pudo conectar ({e.__class__.__name__})")
+    """GET con errores legibles.
+
+    Ante 429/503 (límite de peticiones o sobrecarga) espera y reintenta unas pocas veces.
+    Ante 403 u otro bloqueo se informa y no se insiste.
+    """
+    res = None
+    for intento in range(REINTENTOS + 1):
+        try:
+            res = requests.get(url, params=params, headers=HEADERS, timeout=12)
+        except requests.RequestException as e:
+            raise RuntimeError(f"No se pudo conectar ({e.__class__.__name__})")
+        if res.status_code in (429, 503) and intento < REINTENTOS:
+            time.sleep(ESPERA_REINTENTO * (intento + 1))
+            continue
+        break
+
     if res.status_code in (403, 429, 503):
         raise RuntimeError(f"El sitio bloqueó la consulta ({res.status_code})")
     if res.status_code != 200:
@@ -191,7 +206,7 @@ def extraer_producto(soup: BeautifulSoup) -> dict:
 #   {"estado": "ok", "exacto", "titulo", "url", "precio", "disponible"}
 # y lanza RuntimeError si la consulta falla (los errores no se cachean).
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def consultar_ms(codigo: str) -> dict:
     res = _get(
         "https://www.msrepuestos.cl/search/suggest.json",
@@ -232,7 +247,7 @@ def consultar_ms(codigo: str) -> dict:
     }
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def consultar_boston(codigo: str) -> dict:
     clave = normalizar(codigo)
     res = _get(BOSTON_BUSQUEDA.format(q=quote(codigo)))
@@ -737,8 +752,15 @@ def mostrar_resultados(resultados):
     if con_dif:
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown('<div class="kia-section">Diferencia de precio vs. el mercado</div>', unsafe_allow_html=True)
-        df_g = pd.DataFrame(con_dif).sort_values("Dif %", ascending=False)
+        df_g = pd.DataFrame(con_dif)
+
+        # Con muchos códigos, solo se dibujan los de mayor diferencia (en valor absoluto)
+        recortado = len(df_g) > MAX_GRAFICO
+        if recortado:
+            df_g = df_g.reindex(df_g["Dif %"].abs().sort_values(ascending=False).index).head(MAX_GRAFICO)
+        df_g = df_g.sort_values("Dif %", ascending=False)
         df_g["Etiqueta"] = df_g["Dif %"].map(lambda v: f"{v:+.1f}%")
+
         fig = px.bar(
             df_g, x="Dif %", y="Código", orientation="h", color="Posición", text="Etiqueta",
             color_discrete_map={"Más barato": NEGRO, "Más caro": ROJO, "Igual": "#9CA3AF"},
@@ -750,10 +772,15 @@ def mostrar_resultados(resultados):
             xaxis=dict(showgrid=True, gridcolor="#E5E7EB", title="Diferencia (%)", zeroline=True, zerolinecolor=NEGRO),
             yaxis=dict(title="", autorange="reversed"),
             margin=dict(l=20, r=20, t=20, b=20),
-            height=max(260, 42 * len(df_g) + 100), bargap=0.35,
+            height=min(1200, max(260, 42 * len(df_g) + 100)), bargap=0.35,
         )
         fig.update_traces(textposition="outside", textfont=dict(color=NEGRO, size=12), marker_line_width=0)
         st.plotly_chart(fig, use_container_width=True)
+        if recortado:
+            st.caption(
+                f"El gráfico muestra los {MAX_GRAFICO} códigos con mayor diferencia porcentual. "
+                "La tabla y el CSV incluyen todos."
+            )
 
     # Descarga
     df_csv = pd.DataFrame([fila_csv(r) for r in resultados])
@@ -771,7 +798,8 @@ def vista_masiva():
         f"Pega hasta {MAX_CODIGOS} códigos, uno por línea, con su precio opcional al lado "
         "(separado por coma, tabulación o punto y coma; puedes copiar dos columnas desde Excel). "
         "O sube un Excel/CSV con una columna de código y otra cuyo nombre contenga «precio». "
-        "Si subes un archivo, se usa en vez del texto."
+        "Si subes un archivo, se usa en vez del texto. "
+        "Las listas grandes pueden tardar varios minutos: mantén esta pestaña abierta."
     )
 
     with st.form("form_masivo"):
