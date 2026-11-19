@@ -32,6 +32,7 @@ REINTENTOS = 2           # reintentos ante 429/503
 ESPERA_REINTENTO = 3     # segundos base de espera (se multiplica por el nº de intento)
 CACHE_TTL = 1800         # segundos que se guardan los resultados por código
 MAX_GRAFICO = 40         # máximo de códigos que se dibujan en el gráfico masivo
+MAX_FICHAS = 5           # máximo de fichas por código que se revisan en Boston
 
 # Repuestos Boston (parece una tienda Magento; ajusta esta URL si su buscador es distinto).
 # {q} se reemplaza por el código buscado.
@@ -105,6 +106,30 @@ def limpiar_precio(valor):
     return int(digitos) if digitos else None
 
 
+RE_NO_ORIGINAL = re.compile(
+    r"\bno\s+(es\s+)?(original|genuin[oa])|alternativ[oa]|gen[eé]ric[oa]|aftermarket|r[eé]plica",
+    re.I,
+)
+RE_ORIGINAL = re.compile(r"\boriginal(es)?\b|\bgenuin[oa]s?\b", re.I)
+
+
+def detectar_original(*textos):
+    """True si dice original, False si dice alternativo/no original, None si no se puede saber."""
+    t = " ".join(re.sub(r"<[^>]+>", " ", str(x)) for x in textos if x).strip()
+    if not t:
+        return None
+    if RE_NO_ORIGINAL.search(t):
+        return False
+    if RE_ORIGINAL.search(t):
+        return True
+    return None
+
+
+def etiqueta_original(c: dict) -> str:
+    o = c.get("original")
+    return "Original" if o is True else "No original" if o is False else "No indicado"
+
+
 # ---------------------------------------------------------------------------
 # HTTP y lectura de fichas de producto
 # ---------------------------------------------------------------------------
@@ -144,8 +169,8 @@ def _iter_json(obj):
 
 
 def extraer_producto(soup: BeautifulSoup) -> dict:
-    """Lee título, precio y disponibilidad desde los datos estructurados de una ficha de producto."""
-    titulo, precio, disponible = None, None, None
+    """Lee título, precio, disponibilidad y descripción de una ficha de producto."""
+    titulo, precio, disponible, descripcion = None, None, None, None
 
     # 1) JSON-LD (schema.org/Product)
     for tag in soup.find_all("script", type="application/ld+json"):
@@ -159,6 +184,7 @@ def extraer_producto(soup: BeautifulSoup) -> dict:
             if "Product" not in tipos:
                 continue
             titulo = titulo or nodo.get("name")
+            descripcion = descripcion or nodo.get("description")
             ofertas = nodo.get("offers") or []
             if isinstance(ofertas, dict):
                 ofertas = [ofertas]
@@ -193,18 +219,34 @@ def extraer_producto(soup: BeautifulSoup) -> dict:
         h1 = soup.find("h1")
         titulo = (og.get("content") if og else None) or (h1.get_text(strip=True) if h1 else None)
 
+    if not descripcion:
+        for selector in (".product.attribute.description", "#description", '[itemprop="description"]'):
+            el = soup.select_one(selector)
+            if el is not None:
+                descripcion = el.get_text(" ", strip=True)
+                break
+    if not descripcion:
+        for selector in ('meta[name="description"]', 'meta[property="og:description"]'):
+            el = soup.select_one(selector)
+            if el is not None and el.get("content"):
+                descripcion = el["content"]
+                break
+
     return {
         "titulo": (titulo or "Producto encontrado").strip(),
         "precio": precio if precio and precio > 0 else None,
         "disponible": disponible,
+        "descripcion": descripcion or "",
     }
 
 
 # ---------------------------------------------------------------------------
 # Competidores. Cada función devuelve:
 #   {"estado": "sin_resultados"}  o
-#   {"estado": "ok", "exacto", "titulo", "url", "precio", "disponible"}
+#   {"estado": "ok", "exacto", "titulo", "url", "precio", "disponible",
+#    "original", "n_coincidencias"}
 # y lanza RuntimeError si la consulta falla (los errores no se cachean).
+# Si hay varias fichas con el mismo código, se queda con la de mayor precio.
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def consultar_ms(codigo: str) -> dict:
@@ -221,29 +263,30 @@ def consultar_ms(codigo: str) -> dict:
     if not productos:
         return {"estado": "sin_resultados"}
 
-    # Primer producto cuyo título/handle/tags contenga el código buscado
-    clave = normalizar(codigo)
-    elegido, exacto = None, False
-    for p in productos:
-        texto = normalizar(f"{p.get('title', '')} {p.get('handle', '')} {p.get('tags', '')}")
-        if clave and clave in texto:
-            elegido, exacto = p, True
-            break
-    if elegido is None:
-        elegido = productos[0]
+    def precio_de(p):
+        try:
+            return float(p.get("price", 0))
+        except (TypeError, ValueError):
+            return 0.0
 
-    try:
-        precio = float(elegido.get("price", 0))
-    except (TypeError, ValueError):
-        precio = 0.0
+    # Todos los productos cuyo título/handle/tags contengan el código; se elige el de mayor precio
+    clave = normalizar(codigo)
+    coinciden = [
+        p for p in productos
+        if clave and clave in normalizar(f"{p.get('title', '')} {p.get('handle', '')} {p.get('tags', '')}")
+    ]
+    exacto = bool(coinciden)
+    elegido = max(coinciden, key=precio_de) if coinciden else productos[0]
 
     return {
         "estado": "ok",
         "exacto": exacto,
         "titulo": elegido.get("title", "Producto encontrado"),
         "url": "https://www.msrepuestos.cl" + elegido.get("url", ""),
-        "precio": precio,
+        "precio": precio_de(elegido),
         "disponible": elegido.get("available"),
+        "original": detectar_original(elegido.get("title"), elegido.get("body"), elegido.get("tags")),
+        "n_coincidencias": len(coinciden) or 1,
     }
 
 
@@ -253,9 +296,11 @@ def consultar_boston(codigo: str) -> dict:
     res = _get(BOSTON_BUSQUEDA.format(q=quote(codigo)))
     soup = BeautifulSoup(res.text, "html.parser")
 
+    fichas = []  # lista de (url, datos de la ficha)
+
     # Si el buscador redirige directo a la ficha, la usamos tal cual
     if res.url.split("?")[0].endswith(".html") and "catalogsearch" not in res.url:
-        url_producto, soup_producto = res.url, soup
+        fichas.append((res.url, extraer_producto(soup)))
     else:
         # Enlaces a productos cuyo URL o texto contengan el código
         candidatos = []
@@ -268,15 +313,19 @@ def consultar_boston(codigo: str) -> dict:
         if not candidatos:
             return {"estado": "sin_resultados"}
 
-        url_producto = candidatos[0]
-        time.sleep(0.3)
-        res_p = _get(url_producto)
-        soup_producto = BeautifulSoup(res_p.text, "html.parser")
+        for url in candidatos[:MAX_FICHAS]:
+            time.sleep(0.3)
+            try:
+                res_p = _get(url)
+            except RuntimeError:
+                continue
+            fichas.append((url, extraer_producto(BeautifulSoup(res_p.text, "html.parser"))))
 
-    prod = extraer_producto(soup_producto)
-    if prod["precio"] is None:
+    fichas = [(u, p) for u, p in fichas if p["precio"] is not None]
+    if not fichas:
         raise RuntimeError("Encontré la ficha pero no pude leer el precio")
 
+    url_producto, prod = max(fichas, key=lambda f: f[1]["precio"])
     exacto = bool(clave) and clave in normalizar(prod["titulo"] + " " + url_producto)
     return {
         "estado": "ok",
@@ -285,6 +334,8 @@ def consultar_boston(codigo: str) -> dict:
         "url": url_producto,
         "precio": float(prod["precio"]),
         "disponible": prod["disponible"],
+        "original": detectar_original(prod["titulo"], prod["descripcion"]),
+        "n_coincidencias": len(fichas),
     }
 
 
@@ -584,10 +635,15 @@ def vista_individual():
                     f"{nombre}: el producto encontrado no contiene el código buscado en su título. "
                     "Verifica la ficha original antes de usar este dato."
                 )
+            clase_orig = {"Original": "good", "No original": "bad"}.get(etiqueta_original(c), "neutral")
+            extra = (
+                f" · {c['n_coincidencias']} fichas con este código (se muestra la de mayor valor)"
+                if c.get("n_coincidencias", 1) > 1 else ""
+            )
             st.markdown(f"""
 <div class="product-card">
-<div class="eyebrow">Coincidencia detectada · {html.escape(nombre)}</div>
-<h3>{html.escape(c["titulo"])}</h3>
+<div class="eyebrow">Coincidencia detectada · {html.escape(nombre)}{html.escape(extra)}</div>
+<h3>{html.escape(c["titulo"])} <span class="badge {clase_orig}">{etiqueta_original(c)}</span></h3>
 <a href="{html.escape(c["url"])}" target="_blank">Ver ficha original en la web del competidor ↗</a>
 </div>
 """, unsafe_allow_html=True)
@@ -659,7 +715,11 @@ def celda_competidor(c: dict, es_ref: bool) -> str:
     texto = fmt(c["precio"]) + ("" if c.get("exacto") else " ⚠")
     titulo = html.escape(c.get("titulo", ""))
     url = html.escape(c.get("url", ""))
-    return f'<td class="{clase}"><a href="{url}" target="_blank" title="{titulo}">{texto}</a></td>'
+    clase_orig = {"Original": "good", "No original": "bad"}.get(etiqueta_original(c), "neutral")
+    return (
+        f'<td class="{clase}"><a href="{url}" target="_blank" title="{titulo}">{texto}</a><br>'
+        f'<span class="badge {clase_orig}">{etiqueta_original(c)}</span></td>'
+    )
 
 
 def tabla_html(resultados) -> str:
@@ -701,6 +761,8 @@ def fila_csv(r: dict) -> dict:
         out[f"{nombre} - precio"] = c.get("precio")
         out[f"{nombre} - producto"] = c.get("titulo") or c.get("error") or ""
         out[f"{nombre} - coincidencia"] = etiqueta_coincidencia(c)
+        out[f"{nombre} - original"] = etiqueta_original(c) if c.get("estado") == "ok" else ""
+        out[f"{nombre} - fichas encontradas"] = c.get("n_coincidencias", "")
         out[f"{nombre} - stock"] = (
             "Disponible" if c.get("disponible") is True else "Agotado" if c.get("disponible") is False else ""
         )
@@ -740,7 +802,8 @@ def mostrar_resultados(resultados):
     st.markdown(tabla_html(resultados), unsafe_allow_html=True)
     st.caption(
         "La comparación (Dif $, Dif %, Posición) es contra el competidor más barato con coincidencia, "
-        "resaltado en verde. Cada precio enlaza a la ficha del competidor. "
+        "resaltado en verde. Si un competidor tiene varias fichas con el mismo código, se muestra la de mayor valor. "
+        "Cada precio enlaza a la ficha del competidor. "
         "Un ⚠ indica que el título del producto no contiene el código buscado: confirma que sea el mismo repuesto."
     )
 
